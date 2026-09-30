@@ -12,7 +12,7 @@
 import 'dotenv/config';
 import { Client, Events, GatewayIntentBits, MessageFlags } from 'discord.js';
 import logger from './logs/pino.js';
-import { CHAT_LOG_LIMIT, GEMINI_COMMAND, REPLY_COMMAND, botIdentity, createChat, geminiPrompt, lineFromMessage, replyName } from './chat.js';
+import { CHAT_LOG_LIMIT, GEMINI_COMMAND, MIN_ROAST_LINES, ROAST_COMMAND, botIdentity, createChat, geminiPrompt, lineFromMessage, roastName } from './chat.js';
 import { FEEDS, commitRetry, commitSuccess, fetchFeed, formatMessage, formatStatusReport, shouldAnnounce } from './feeds.js';
 import { DEFAULT_MODEL, createAsker, createRoaster } from './roast.js';
 import { feedState, loadState, saveState } from './state.js';
@@ -168,6 +168,13 @@ const geminiInFlight = new Set();
 const roastLine = geminiKey ? createRoaster(geminiKey, geminiModel) : null;
 const askLine = geminiKey ? createAsker(geminiKey, geminiModel) : null;
 let chatQueue = Promise.resolve();
+let chatChannel = null;
+let roastDay = '';
+let timedRoasts = 0;
+const manualRoasts = new Set();
+const timedRoastIds = new Set();
+let roastTimers = [];
+const TIMED_ROASTS_PER_DAY = 2;
 
 function enqueueChat(task) {
     const run = chatQueue.then(task, task);
@@ -260,52 +267,186 @@ async function targetsBot(message, query) {
     }
 }
 
-async function handleReply(message) {
-    const name = replyName(message.content);
-    const userId = message.author.id;
-    const actor = who(message);
-    if (chat.isLocked(userId)) {
-        logger.info(`[!reply] ${actor} refused: locked`);
-        await message.reply(quietMessage('Wait until somebody else says something.'));
+function dayKey(date = new Date()) {
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${date.getFullYear()}-${month}-${day}`;
+}
+
+function rollRoastDay() {
+    const key = dayKey();
+    if (key === roastDay) return key;
+    roastDay = key;
+    timedRoasts = 0;
+    manualRoasts.clear();
+    timedRoastIds.clear();
+    return key;
+}
+
+function restoreRoastDay() {
+    const saved = appState?.roasts;
+    const key = dayKey();
+    roastDay = key;
+    timedRoasts = 0;
+    manualRoasts.clear();
+    timedRoastIds.clear();
+    if (!saved || saved.day !== key) return;
+    const count = Number(saved.timed);
+    if (Number.isFinite(count) && count > 0) timedRoasts = Math.min(TIMED_ROASTS_PER_DAY, Math.floor(count));
+    for (const id of saved.manual || []) manualRoasts.add(String(id));
+    for (const id of saved.timedIds || []) timedRoastIds.add(String(id));
+}
+
+async function saveRoastDay() {
+    if (!appState) return;
+    appState.roasts = {
+        day: roastDay,
+        timed: timedRoasts,
+        manual: [...manualRoasts],
+        timedIds: [...timedRoastIds],
+    };
+    try {
+        await saveState(appState);
+    } catch (err) {
+        logger.error(`Could not save roast day: ${err.message}`);
+    }
+}
+
+async function rememberManualRoast(authorId) {
+    rollRoastDay();
+    manualRoasts.add(authorId);
+    await saveRoastDay();
+}
+
+function clockTime(at) {
+    return new Date(at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+}
+
+async function publishRoast(channel, topic) {
+    const newest = topic.lines[topic.lines.length - 1];
+    const roast = await roastLine(topic.displayName, topic.lines.map((line) => line.content));
+    const mention = `<@${topic.authorId}>`;
+    await channel.send({
+        content: `${mention} ${roast}`.slice(0, 2000),
+        flags: MessageFlags.SuppressEmbeds,
+        allowedMentions: { users: [topic.authorId] },
+    });
+    return chat.consume(topic.authorId, newest.id);
+}
+
+function trackRoastTimer(fn, delay) {
+    const id = setTimeout(fn, Math.max(0, delay));
+    roastTimers.push(id);
+    return id;
+}
+
+function scheduleTimedRoast(day, attempt = 0) {
+    const end = new Date();
+    end.setHours(24, 0, 0, 0);
+    const room = end.getTime() - Date.now();
+    if (room < 60_000) return null;
+    const at = Date.now() + Math.random() * room;
+    trackRoastTimer(() => {
+        enqueueChat(() => runTimedRoast(day, attempt));
+    }, at - Date.now());
+    return at;
+}
+
+async function runTimedRoast(day, attempt) {
+    if (rollRoastDay() !== day || timedRoasts >= TIMED_ROASTS_PER_DAY || !roastLine || !chatChannel) return;
+    const choices = chat.roastable().filter((topic) => !manualRoasts.has(topic.authorId) && !timedRoastIds.has(topic.authorId));
+    if (!choices.length) {
+        logger.info('[!roast] timed roast skipped: nobody with enough lines who has not been roasted manually');
+        if (attempt < 1) scheduleTimedRoast(day, attempt + 1);
         return;
     }
+    const topic = choices[Math.floor(Math.random() * choices.length)];
+    try {
+        const needed = await publishRoast(chatChannel, topic);
+        timedRoasts += 1;
+        timedRoastIds.add(topic.authorId);
+        await saveRoastDay();
+        logger.info(`[!roast] timed roast ${timedRoasts}/${TIMED_ROASTS_PER_DAY} of ${topic.displayName} from ${topic.lines.length} lines; next roast after ${needed} new lines`);
+    } catch (err) {
+        logger.error(`[!roast] timed roast failed: ${err.message}`);
+        if (err.usageLimit && chatChannel) await chatChannel.send(quietMessage(err.message));
+    }
+}
+
+function scheduleRoastDay() {
+    for (const id of roastTimers) clearTimeout(id);
+    roastTimers = [];
+    const day = rollRoastDay();
+    if (!chatChannel || !roastLine) return;
+    const remaining = TIMED_ROASTS_PER_DAY - timedRoasts;
+    const slots = [];
+    for (let i = 0; i < remaining; i += 1) {
+        const at = scheduleTimedRoast(day);
+        if (at) slots.push(clockTime(at));
+    }
+    const end = new Date();
+    end.setHours(24, 0, 0, 0);
+    trackRoastTimer(() => scheduleRoastDay(), end.getTime() - Date.now() + 1000);
+    if (remaining <= 0) {
+        logger.info(`Timed roasts for ${day}: already ${timedRoasts}/${TIMED_ROASTS_PER_DAY}`);
+        return;
+    }
+    if (slots.length) {
+        const done = timedRoasts > 0 ? ` (${timedRoasts}/${TIMED_ROASTS_PER_DAY} already done)` : '';
+        logger.info(`Timed roasts for ${day}: ${slots.join(', ')}${done}`);
+    }
+}
+
+async function handleRoast(message) {
+    const name = roastName(message.content);
+    const userId = message.author.id;
+    const actor = who(message);
     if (roastInFlight.has(userId)) {
-        logger.info(`[!reply] ${actor} refused: roast already running`);
+        logger.info(`[!roast] ${actor} refused: roast already running`);
         await message.reply(quietMessage('Still roasting. Wait for that one to finish.'));
         return;
     }
     if (!name) {
-        logger.info(`[!reply] ${actor} refused: missing username`);
-        await message.reply(quietMessage('Usage: !reply <username>'));
+        logger.info(`[!roast] ${actor} refused: missing username`);
+        await message.reply(quietMessage('Usage: !roast <username>'));
         return;
     }
 
     roastInFlight.add(userId);
     try {
         const namedByMention = /<@!?\d+>/.test(name);
-        const target = chat.findLatest(name);
-        if (await targetsBot(message, name) && (namedByMention || !target)) {
-            logger.info(`[!reply] ${actor} refused: ${clip(name)} is a bot`);
+        const topic = chat.topic(name);
+        if (await targetsBot(message, name) && (namedByMention || topic.status === 'none')) {
+            logger.info(`[!roast] ${actor} refused: ${clip(name)} is a bot`);
             await message.reply(quietMessage('Pick a person, not a bot.'));
             return;
         }
-        if (!target) {
-            logger.info(`[!reply] ${actor} refused: no line from ${clip(name)}`);
-            await message.reply(quietMessage('No recent line from that user.'));
+        if (topic.status === 'none') {
+            logger.info(`[!roast] ${actor} refused: no lines from ${clip(name)}`);
+            await message.reply(quietMessage('No recent lines from that user.'));
+            return;
+        }
+        if (topic.status === 'locked') {
+            const left = Math.max(0, topic.needed - topic.spoken);
+            logger.info(`[!roast] ${actor} refused: ${topic.displayName} needs ${left} more lines`);
+            await message.reply(quietMessage(`They're talked out for now. ${left} more line${left === 1 ? '' : 's'} from them, then another roast.`));
+            return;
+        }
+        if (topic.status === 'short') {
+            logger.info(`[!roast] ${actor} refused: ${topic.displayName} has ${topic.have} lines`);
+            await message.reply(quietMessage(`Need at least ${MIN_ROAST_LINES} lines from that user.`));
             return;
         }
         if (!roastLine) {
-            logger.info(`[!reply] ${actor} refused: GEMINI_API_KEY is not set`);
+            logger.info(`[!roast] ${actor} refused: GEMINI_API_KEY is not set`);
             await message.reply(quietMessage('GEMINI_API_KEY is not set, so roasts are not configured.'));
             return;
         }
-        const roast = await roastLine(target.displayName, target.content);
-        const targetMessage = await message.channel.messages.fetch(target.id);
-        await targetMessage.reply(roastPost(roast));
-        chat.lock(userId);
-        logger.info(`[!reply] ${actor} roasted ${target.displayName}: ${clip(target.content)}`);
+        const needed = await publishRoast(message.channel, topic);
+        await rememberManualRoast(topic.authorId);
+        logger.info(`[!roast] ${actor} roasted ${topic.displayName} from ${topic.lines.length} lines; next roast after ${needed} new lines`);
     } catch (err) {
-        logger.error(`[!reply] ${actor} failed: ${err.message}`);
+        logger.error(`[!roast] ${actor} failed: ${err.message}`);
         if (err.usageLimit) {
             await message.channel.send(quietMessage(err.message));
             return;
@@ -363,11 +504,11 @@ async function handleChatMessage(message) {
         return;
     }
     const content = message.content.trim();
-    if (REPLY_COMMAND.test(content)) {
+    if (ROAST_COMMAND.test(content)) {
         try {
-            await handleReply(message);
+            await handleRoast(message);
         } catch (err) {
-            logger.error(`[!reply] ${who(message)} failed: ${err.message}`);
+            logger.error(`[!roast] ${who(message)} failed: ${err.message}`);
         }
         return;
     }
@@ -380,8 +521,11 @@ async function handleChatMessage(message) {
         return;
     }
     const line = lineFromMessage(message);
-    const cleared = line ? chat.record(line).cleared : chat.unlockOthers(message.author.id);
-    if (cleared) logger.info(`[chat] ${who(message)} cleared ${cleared} !reply lock${cleared === 1 ? '' : 's'}`);
+    if (!line) return;
+    const recorded = chat.record(line);
+    if (recorded.ready) {
+        logger.info(`[chat] ${who(message)} can be roasted again after ${recorded.spoken} lines`);
+    }
 }
 
 async function seedChat(channel) {
@@ -419,6 +563,7 @@ async function openChatChannel(readyClient) {
         logger.error(`Could not read the bot nickname: ${err.message}`);
     }
     chat.rememberBot(self);
+    chatChannel = channel;
     let seeded = 0;
     try {
         seeded = await seedChat(channel);
@@ -428,10 +573,11 @@ async function openChatChannel(readyClient) {
     const chatName = channel.name ? `#${channel.name}` : chatChannelId;
     logger.info(`Chat channel ${chatName}: ${seeded} recent lines loaded`);
     if (geminiKey) {
-        logger.info(`Chat commands: !reply <username>, !gemini <prompt> (${geminiModel})`);
+        logger.info(`Chat commands: !roast <username>, !gemini <prompt> (${geminiModel})`);
     } else {
-        logger.warn('GEMINI_API_KEY is not set. !reply and !gemini will say roasts are not configured.');
+        logger.warn('GEMINI_API_KEY is not set. !roast and !gemini will say they are not configured.');
     }
+    scheduleRoastDay();
 }
 
 const client = new Client({
@@ -464,11 +610,12 @@ client.on(Events.ShardResume, (shardId, replayed) => {
 
 client.once(Events.ClientReady, async (readyClient) => {
     logger.info(`Logged in as ${readyClient.user.tag}`);
+    appState = await loadState();
+    restoreRoastDay();
     const chatStartup = chatChannelId
         ? enqueueChat(() => openChatChannel(readyClient))
         : Promise.resolve();
     const channel = await fetchTextChannel(readyClient, statusChannelId, 'status channel');
-    appState = await loadState();
     const statusName = channel.name ? `#${channel.name}` : statusChannelId;
     logger.info(`Status channel ${statusName}: watching ${FEEDS.map((feed) => feed.name).join(', ')} (base interval ${describeWait(pollIntervalMs)})`);
     logger.info('!aistatus in the status channel replies with the latest incident from each feed');

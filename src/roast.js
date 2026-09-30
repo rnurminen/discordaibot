@@ -15,7 +15,7 @@ const DISCORD_LIMIT = 2000;
 const REQUEST_TIMEOUT_MS = 20_000;
 
 const SYSTEM_PROMPT = [
-    'You write a short Discord roast of one person, about the message they just posted.',
+    'You write a short Discord roast of one person, about what they have been saying in their recent messages.',
     'Be mean, witty, and funny. Don\'t use curse words. Verbally tear apart what they said.',
     'Two to four sentences. Address them by the name you are given.',
     'No identity-based slurs. No threats of real-world harm.',
@@ -123,10 +123,11 @@ function createClient(apiKey, model) {
 
 export function createRoaster(apiKey, model = DEFAULT_MODEL) {
     const generate = createClient(apiKey, model);
-    return function roastLine(name, text) {
+    return function roastLines(name, texts) {
+        const quoted = texts.map((text, index) => `${index + 1}. ${text}`).join('\n');
         return generate({
             system: SYSTEM_PROMPT,
-            user: `Roast ${name} for this message:\n${text}`,
+            user: `Roast ${name} based on these recent messages, oldest first:\n${quoted}`,
             safetySettings: [{
                 category: 'HARM_CATEGORY_HARASSMENT',
                 threshold: 'BLOCK_NONE',
