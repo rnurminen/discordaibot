@@ -211,16 +211,16 @@ function roastPost(content) {
     };
 }
 
-function codeBlock(text, heading) {
+function codeBlock(text, suffix = '') {
     const answer = String(text || '').replace(/\s+$/, '');
-    const prefix = heading ? `${heading}\n\n` : '';
-    const body = `${prefix}${answer}`;
+    const tail = suffix ? ` ${suffix}` : '';
+    const body = `${answer}${tail}`;
     const runs = body.match(/`+/g) || [];
     const longest = runs.reduce((n, run) => Math.max(n, run.length), 0);
     const fence = '`'.repeat(Math.max(3, longest + 1));
     const overhead = fence.length * 2 + 2;
-    const room = Math.max(0, 2000 - overhead - prefix.length);
-    return `${fence}\n${prefix}${answer.slice(0, room)}\n${fence}`;
+    const room = Math.max(0, 2000 - overhead - tail.length);
+    return `${fence}\n${answer.slice(0, room)}${tail}\n${fence}`;
 }
 
 function isHumanMessage(message) {
@@ -340,7 +340,7 @@ async function handleGemini(message) {
     try {
         logger.info(`[!gemini] ${actor}: ${clip(prompt)}`);
         const answer = await askLine(prompt);
-        await message.channel.send(roastPost(codeBlock(answer, `${geminiModel} reply:`)));
+        await message.channel.send(roastPost(codeBlock(answer, `(${geminiModel})`)));
         logger.info(`[!gemini] ${actor} answered (${answer.length} chars)`);
     } catch (err) {
         logger.error(`[!gemini] ${actor} failed: ${err.message}`);
