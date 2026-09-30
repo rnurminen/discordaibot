@@ -72,9 +72,14 @@ export function createChat() {
     const knownBots = new Map();
 
     function unlockOthers(authorId) {
+        let cleared = 0;
         for (const id of [...lockedUsers]) {
-            if (id !== authorId) lockedUsers.delete(id);
+            if (id !== authorId) {
+                lockedUsers.delete(id);
+                cleared += 1;
+            }
         }
+        return cleared;
     }
 
     return {
@@ -100,12 +105,11 @@ export function createChat() {
         },
 
         record(line) {
-            if (!line?.id || !line.authorId || !line.content) return false;
-            if (lines.some((existing) => existing.id === line.id)) return false;
+            if (!line?.id || !line.authorId || !line.content) return { added: false, cleared: 0 };
+            if (lines.some((existing) => existing.id === line.id)) return { added: false, cleared: 0 };
             lines.push(line);
             if (lines.length > CHAT_LOG_LIMIT) lines.shift();
-            unlockOthers(line.authorId);
-            return true;
+            return { added: true, cleared: unlockOthers(line.authorId) };
         },
 
         unlockOthers,
