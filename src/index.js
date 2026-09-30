@@ -272,7 +272,7 @@ async function handleReply(message) {
             await message.channel.send(quietMessage(err.message));
             return;
         }
-        await message.reply(quietMessage('Could not roast them. Try again.'));
+        await message.reply(quietMessage((err.message || 'Could not roast them.').slice(0, 2000)));
     } finally {
         roastInFlight.delete(userId);
     }
@@ -305,7 +305,7 @@ async function handleGemini(message) {
             await message.channel.send(quietMessage(err.message));
             return;
         }
-        await message.reply(quietMessage('Could not ask Gemini. Try again.'));
+        await message.reply(quietMessage((err.message || 'Could not ask Gemini.').slice(0, 2000)));
     } finally {
         geminiInFlight.delete(userId);
     }
