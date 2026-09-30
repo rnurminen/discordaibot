@@ -11,15 +11,20 @@
 
 import 'dotenv/config';
 import { Client, Events, GatewayIntentBits, MessageFlags } from 'discord.js';
+import { CHAT_LOG_LIMIT, GEMINI_COMMAND, REPLY_COMMAND, botIdentity, createChat, geminiPrompt, lineFromMessage, replyName } from './chat.js';
 import { FEEDS, commitRetry, commitSuccess, fetchFeed, formatMessage, formatStatusReport, shouldAnnounce } from './feeds.js';
+import { DEFAULT_MODEL, createAsker, createRoaster } from './roast.js';
 import { feedState, loadState, saveState } from './state.js';
 
 const token = process.env.DISCORD_TOKEN?.trim();
-const channelId = process.env.DISCORD_CHANNEL_ID?.trim();
+const statusChannelId = process.env.DISCORD_STATUS_CHANNEL_ID?.trim();
+const chatChannelId = process.env.DISCORD_CHAT_CHANNEL_ID?.trim() || '';
+const geminiKey = process.env.GEMINI_API_KEY?.trim() || '';
+const geminiModel = process.env.GEMINI_MODEL?.trim() || DEFAULT_MODEL;
 const pollIntervalMs = Number(process.env.POLL_INTERVAL_MS || 60_000);
 
-if (!token || !channelId) {
-    console.error('Set DISCORD_TOKEN and DISCORD_CHANNEL_ID. See .env.example.');
+if (!token || !statusChannelId) {
+    console.error('Set DISCORD_TOKEN and DISCORD_STATUS_CHANNEL_ID. See .env.example.');
     process.exit(1);
 }
 
@@ -151,6 +156,18 @@ async function tick(state, channel) {
 const STATUS_COMMAND = /^!aistatus(?:\s|$)/i;
 
 let appState = null;
+const chat = createChat();
+const roastInFlight = new Set();
+const geminiInFlight = new Set();
+const roastLine = geminiKey ? createRoaster(geminiKey, geminiModel) : null;
+const askLine = geminiKey ? createAsker(geminiKey, geminiModel) : null;
+let chatQueue = Promise.resolve();
+
+function enqueueChat(task) {
+    const run = chatQueue.then(task, task);
+    chatQueue = run.then(() => undefined, () => undefined);
+    return run;
+}
 
 function statusReport(state) {
     return formatStatusReport(FEEDS.map((feed) => ({
@@ -164,6 +181,208 @@ async function replyStatus(message) {
     await message.reply(quietMessage(parts[0]));
     for (const part of parts.slice(1)) {
         await enqueueSend(message.channel, part);
+    }
+}
+
+function roastPost(content) {
+    return {
+        content,
+        flags: MessageFlags.SuppressEmbeds,
+        allowedMentions: { parse: [], repliedUser: true },
+    };
+}
+
+function isHumanMessage(message) {
+    return Boolean(message.author) && !message.author.bot && !message.webhookId && !message.system;
+}
+
+async function fetchTextChannel(readyClient, id, label) {
+    let channel;
+    try {
+        channel = await readyClient.channels.fetch(id);
+    } catch (err) {
+        console.error(`Could not fetch ${label} ${id}: ${err.message}`);
+        process.exit(1);
+    }
+    if (!channel?.isTextBased?.() || typeof channel.send !== 'function') {
+        const title = `${label.charAt(0).toUpperCase()}${label.slice(1)}`;
+        console.error(`${title} ${id} is not a text channel this bot can post in.`);
+        process.exit(1);
+    }
+    return channel;
+}
+
+async function targetsBot(message, query) {
+    if (chat.isKnownBot(query)) return true;
+    const mention = query.match(/<@!?(\d+)>/);
+    if (!mention) return false;
+    const mentioned = message.mentions.users.get(mention[1]);
+    if (mentioned) return mentioned.bot;
+    try {
+        const user = await message.client.users.fetch(mention[1]);
+        if (!user.bot) return false;
+        chat.rememberBot(botIdentity({ author: user, member: null }));
+        return true;
+    } catch (err) {
+        console.error(`Could not look up ${mention[1]}: ${err.message}`);
+        return false;
+    }
+}
+
+async function handleReply(message) {
+    const name = replyName(message.content);
+    const userId = message.author.id;
+    if (chat.isLocked(userId)) {
+        await message.reply(quietMessage('Wait until somebody else says something.'));
+        return;
+    }
+    if (roastInFlight.has(userId)) {
+        await message.reply(quietMessage('Still roasting. Wait for that one to finish.'));
+        return;
+    }
+    if (!name) {
+        await message.reply(quietMessage('Usage: !reply <username>'));
+        return;
+    }
+
+    roastInFlight.add(userId);
+    try {
+        const namedByMention = /<@!?\d+>/.test(name);
+        const target = chat.findLatest(name);
+        if (await targetsBot(message, name) && (namedByMention || !target)) {
+            await message.reply(quietMessage('Pick a person, not a bot.'));
+            return;
+        }
+        if (!target) {
+            await message.reply(quietMessage('No recent line from that user.'));
+            return;
+        }
+        if (!roastLine) {
+            await message.reply(quietMessage('GEMINI_API_KEY is not set, so roasts are not configured.'));
+            return;
+        }
+        const roast = await roastLine(target.displayName, target.content);
+        const targetMessage = await message.channel.messages.fetch(target.id);
+        await targetMessage.reply(roastPost(roast));
+        chat.lock(userId);
+        console.log(`Roasted ${target.displayName} for ${message.author.username}`);
+    } catch (err) {
+        console.error(`Failed to roast: ${err.message}`);
+        if (err.usageLimit) {
+            await message.channel.send(quietMessage(err.message));
+            return;
+        }
+        await message.reply(quietMessage('Could not roast them. Try again.'));
+    } finally {
+        roastInFlight.delete(userId);
+    }
+}
+
+async function handleGemini(message) {
+    const prompt = geminiPrompt(message.content);
+    const userId = message.author.id;
+    if (geminiInFlight.has(userId)) {
+        await message.reply(quietMessage('Still answering. Wait for that one to finish.'));
+        return;
+    }
+    if (!prompt) {
+        await message.reply(quietMessage('Usage: !gemini <prompt>'));
+        return;
+    }
+    if (!askLine) {
+        await message.reply(quietMessage('GEMINI_API_KEY is not set, so Gemini is not configured.'));
+        return;
+    }
+
+    geminiInFlight.add(userId);
+    try {
+        const answer = await askLine(prompt);
+        await message.reply(roastPost(answer));
+        console.log(`Answered !gemini for ${message.author.username}`);
+    } catch (err) {
+        console.error(`Failed to answer !gemini: ${err.message}`);
+        if (err.usageLimit) {
+            await message.channel.send(quietMessage(err.message));
+            return;
+        }
+        await message.reply(quietMessage('Could not ask Gemini. Try again.'));
+    } finally {
+        geminiInFlight.delete(userId);
+    }
+}
+
+async function handleChatMessage(message) {
+    if (!isHumanMessage(message)) {
+        if (message.author?.bot || message.webhookId) {
+            const identity = botIdentity(message);
+            if (identity) chat.rememberBot(identity);
+        }
+        return;
+    }
+    const content = message.content.trim();
+    if (REPLY_COMMAND.test(content)) {
+        try {
+            await handleReply(message);
+        } catch (err) {
+            console.error(`Failed to reply to !reply: ${err.message}`);
+        }
+        return;
+    }
+    if (GEMINI_COMMAND.test(content)) {
+        try {
+            await handleGemini(message);
+        } catch (err) {
+            console.error(`Failed to reply to !gemini: ${err.message}`);
+        }
+        return;
+    }
+    const line = lineFromMessage(message);
+    if (line) chat.record(line);
+    else chat.unlockOthers(message.author.id);
+}
+
+async function seedChat(channel) {
+    const history = await channel.messages.fetch({ limit: CHAT_LOG_LIMIT });
+    const ordered = [...history.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+    for (const message of ordered) {
+        if (!isHumanMessage(message)) {
+            if (message.author?.bot || message.webhookId) {
+                const identity = botIdentity(message);
+                if (identity) chat.rememberBot(identity);
+            }
+            continue;
+        }
+        const line = lineFromMessage(message);
+        if (line) chat.record(line);
+    }
+}
+
+async function openChatChannel(readyClient) {
+    const channel = await fetchTextChannel(readyClient, chatChannelId, 'chat channel');
+    const self = {
+        id: readyClient.user.id,
+        username: readyClient.user.username,
+        globalName: readyClient.user.globalName || '',
+        nickname: '',
+        displayName: readyClient.user.globalName || readyClient.user.username,
+    };
+    try {
+        const member = await channel.guild?.members.fetch(readyClient.user.id);
+        if (member?.nickname) self.nickname = member.nickname;
+        if (member?.displayName) self.displayName = member.displayName;
+    } catch (err) {
+        console.error(`Could not read the bot nickname: ${err.message}`);
+    }
+    chat.rememberBot(self);
+    try {
+        await seedChat(channel);
+    } catch (err) {
+        console.error(`Could not read chat history: ${err.message}`);
+    }
+    if (geminiKey) {
+        console.log(`Chat channel: !reply <username> roasts, !gemini <prompt> asks (${geminiModel})`);
+    } else {
+        console.warn('GEMINI_API_KEY is not set. !reply will say roasts are not configured.');
     }
 }
 
@@ -181,25 +400,22 @@ client.on(Events.Error, (err) => {
 
 client.once(Events.ClientReady, async (readyClient) => {
     console.log(`Logged in as ${readyClient.user.tag}`);
-    let channel;
-    try {
-        channel = await readyClient.channels.fetch(channelId);
-    } catch (err) {
-        console.error(`Could not fetch channel ${channelId}: ${err.message}`);
-        process.exit(1);
-    }
-    if (!channel?.isTextBased?.() || typeof channel.send !== 'function') {
-        console.error(`Channel ${channelId} is not a text channel this bot can post in.`);
-        process.exit(1);
-    }
+    const chatStartup = chatChannelId
+        ? enqueueChat(() => openChatChannel(readyClient))
+        : Promise.resolve();
+    const channel = await fetchTextChannel(readyClient, statusChannelId, 'status channel');
     appState = await loadState();
     console.log(`Watching ${FEEDS.map((feed) => feed.name).join(', ')} (base interval ${describeWait(pollIntervalMs)})`);
     console.log('!aistatus in that channel replies with the latest incident from each feed');
+    await chatStartup;
     await tick(appState, channel);
 });
 
 client.on(Events.MessageCreate, async (message) => {
-    if (message.author.bot || message.channelId !== channelId) return;
+    if (chatChannelId && message.channelId === chatChannelId) {
+        enqueueChat(() => handleChatMessage(message));
+    }
+    if (message.author.bot || message.channelId !== statusChannelId) return;
     if (!STATUS_COMMAND.test(message.content.trim())) return;
     try {
         await replyStatus(message);
