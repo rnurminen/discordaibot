@@ -51,6 +51,7 @@ function buildSystemPrompt(recentRoasts = []) {
         '- Mean and witty, but no curse words.',
         '',
         `Angle for this roast: ${pick(ANGLES)}`,
+        'Perform the angle directly; never refer to the narrator, critic, format, or angle itself.',
         '',
         'Avoid these overused patterns:',
         '- Opening with "Oh," or "Well," or "Wow," or with their name followed by a comma.',
@@ -94,7 +95,10 @@ function createRoaster(api) {
             user: `Name: ${name}\nRecent messages:\n${quoted}`,
             temperature: 1,
         });
-        return cleanRoast(result.text).slice(0, DISCORD_LIMIT);
+        return {
+            text: cleanRoast(result.text).slice(0, DISCORD_LIMIT),
+            model: result.model,
+        };
     };
 }
 
@@ -195,12 +199,15 @@ export function createRoast({ api, chat, getState }) {
         const newest = topic.lines[topic.lines.length - 1];
         const roast = await roastLine(topic.displayName, topic.lines.map((line) => line.content), history);
         const mention = `<@${topic.authorId}>`;
+        const suffix = ` (${roast.model})`;
+        const room = Math.max(0, 2000 - mention.length - 1 - suffix.length);
+        const text = roast.text.slice(0, room);
         await channel.send({
-            content: `${mention} ${roast}`.slice(0, 2000),
+            content: `${mention} ${text}${suffix}`,
             flags: MessageFlags.SuppressEmbeds,
             allowedMentions: { users: [topic.authorId] },
         });
-        recentRoasts.set(key, [...history, roast].slice(-8));
+        recentRoasts.set(key, [...history, text].slice(-8));
         return chat.consume(topic.authorId, newest.id);
     }
 
