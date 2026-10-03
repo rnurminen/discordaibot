@@ -178,14 +178,11 @@ export function createChat() {
             return topicFor(match.authorId, match.displayName);
         },
 
-        roastable() {
-            const found = [];
-            for (const [authorId, bucket] of users) {
-                const displayName = bucket[bucket.length - 1]?.displayName || authorId;
-                const topic = topicFor(authorId, displayName);
-                if (topic.status === 'ok') found.push(topic);
-            }
-            return found;
+        authorTopic(authorId) {
+            const bucket = users.get(authorId);
+            if (!bucket?.length) return { status: 'none' };
+            const displayName = bucket[bucket.length - 1]?.displayName || authorId;
+            return topicFor(authorId, displayName);
         },
 
         consume(authorId, newestId) {

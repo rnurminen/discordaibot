@@ -173,8 +173,12 @@ let roastDay = '';
 let timedRoasts = 0;
 const manualRoasts = new Set();
 const timedRoastIds = new Set();
-let roastTimers = [];
-const TIMED_ROASTS_PER_DAY = 2;
+let qualifyingMessages = 0;
+let roastAt = 1;
+let randomRoastRetryAt = 0;
+let randomRoastLimitSent = false;
+const RANDOM_ROASTS_PER_DAY = 1;
+const RANDOM_ROAST_SPAN = 4;
 
 function enqueueChat(task) {
     const run = chatQueue.then(task, task);
@@ -273,13 +277,32 @@ function dayKey(date = new Date()) {
     return `${date.getFullYear()}-${month}-${day}`;
 }
 
+function armRandomRoast() {
+    qualifyingMessages = 0;
+    roastAt = 1 + Math.floor(Math.random() * RANDOM_ROAST_SPAN);
+    randomRoastRetryAt = 0;
+    randomRoastLimitSent = false;
+}
+
+function logRandomRoastPlan(day) {
+    if (!roastLine || !chatChannel) return;
+    if (timedRoasts >= RANDOM_ROASTS_PER_DAY) {
+        logger.info(`Random roast for ${day}: already ${timedRoasts}/${RANDOM_ROASTS_PER_DAY}`);
+        return;
+    }
+    logger.info(`Random roast for ${day}: on qualifying message ${roastAt} of ${RANDOM_ROAST_SPAN}`);
+}
+
 function rollRoastDay() {
     const key = dayKey();
     if (key === roastDay) return key;
+    const followOn = roastDay !== '' && Boolean(chatChannel);
     roastDay = key;
     timedRoasts = 0;
     manualRoasts.clear();
     timedRoastIds.clear();
+    armRandomRoast();
+    if (followOn) logRandomRoastPlan(key);
     return key;
 }
 
@@ -290,11 +313,13 @@ function restoreRoastDay() {
     timedRoasts = 0;
     manualRoasts.clear();
     timedRoastIds.clear();
-    if (!saved || saved.day !== key) return;
-    const count = Number(saved.timed);
-    if (Number.isFinite(count) && count > 0) timedRoasts = Math.min(TIMED_ROASTS_PER_DAY, Math.floor(count));
-    for (const id of saved.manual || []) manualRoasts.add(String(id));
-    for (const id of saved.timedIds || []) timedRoastIds.add(String(id));
+    if (saved?.day === key) {
+        const count = Number(saved.timed);
+        if (Number.isFinite(count) && count > 0) timedRoasts = Math.min(RANDOM_ROASTS_PER_DAY, Math.floor(count));
+        for (const id of saved.manual || []) manualRoasts.add(String(id));
+        for (const id of saved.timedIds || []) timedRoastIds.add(String(id));
+    }
+    armRandomRoast();
 }
 
 async function saveRoastDay() {
@@ -318,10 +343,6 @@ async function rememberManualRoast(authorId) {
     await saveRoastDay();
 }
 
-function clockTime(at) {
-    return new Date(at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-}
-
 async function publishRoast(channel, topic) {
     const newest = topic.lines[topic.lines.length - 1];
     const roast = await roastLine(topic.displayName, topic.lines.map((line) => line.content));
@@ -334,66 +355,39 @@ async function publishRoast(channel, topic) {
     return chat.consume(topic.authorId, newest.id);
 }
 
-function trackRoastTimer(fn, delay) {
-    const id = setTimeout(fn, Math.max(0, delay));
-    roastTimers.push(id);
-    return id;
-}
+async function maybeRandomRoast(authorId) {
+    if (!roastLine || !chatChannel) return;
+    rollRoastDay();
+    if (timedRoasts >= RANDOM_ROASTS_PER_DAY) return;
+    if (manualRoasts.has(authorId) || timedRoastIds.has(authorId)) return;
+    const topic = chat.authorTopic(authorId);
+    if (topic.status !== 'ok') return;
+    if (Date.now() < randomRoastRetryAt) return;
 
-function scheduleTimedRoast(day, attempt = 0) {
-    const end = new Date();
-    end.setHours(24, 0, 0, 0);
-    const room = end.getTime() - Date.now();
-    if (room < 60_000) return null;
-    const at = Date.now() + Math.random() * room;
-    trackRoastTimer(() => {
-        enqueueChat(() => runTimedRoast(day, attempt));
-    }, at - Date.now());
-    return at;
-}
-
-async function runTimedRoast(day, attempt) {
-    if (rollRoastDay() !== day || timedRoasts >= TIMED_ROASTS_PER_DAY || !roastLine || !chatChannel) return;
-    const choices = chat.roastable().filter((topic) => !manualRoasts.has(topic.authorId) && !timedRoastIds.has(topic.authorId));
-    if (!choices.length) {
-        logger.info('[!roast] timed roast skipped: nobody with enough lines who has not been roasted manually');
-        if (attempt < 1) scheduleTimedRoast(day, attempt + 1);
+    qualifyingMessages += 1;
+    if (qualifyingMessages !== roastAt) {
+        logger.info(`[!roast] random roast waiting (${qualifyingMessages}/${roastAt}), passed ${topic.displayName}`);
         return;
     }
-    const topic = choices[Math.floor(Math.random() * choices.length)];
+
     try {
         const needed = await publishRoast(chatChannel, topic);
         timedRoasts += 1;
         timedRoastIds.add(topic.authorId);
         await saveRoastDay();
-        logger.info(`[!roast] timed roast ${timedRoasts}/${TIMED_ROASTS_PER_DAY} of ${topic.displayName} from ${topic.lines.length} lines; next roast after ${needed} new lines`);
+        logger.info(`[!roast] random roast ${timedRoasts}/${RANDOM_ROASTS_PER_DAY} of ${topic.displayName} from ${topic.lines.length} lines; next roast after ${needed} new lines`);
     } catch (err) {
-        logger.error(`[!roast] timed roast failed: ${err.message}`);
-        if (Api.isUsageLimit(err) && chatChannel) await chatChannel.send(quietMessage(err.message));
-    }
-}
-
-function scheduleRoastDay() {
-    for (const id of roastTimers) clearTimeout(id);
-    roastTimers = [];
-    const day = rollRoastDay();
-    if (!chatChannel || !roastLine) return;
-    const remaining = TIMED_ROASTS_PER_DAY - timedRoasts;
-    const slots = [];
-    for (let i = 0; i < remaining; i += 1) {
-        const at = scheduleTimedRoast(day);
-        if (at) slots.push(clockTime(at));
-    }
-    const end = new Date();
-    end.setHours(24, 0, 0, 0);
-    trackRoastTimer(() => scheduleRoastDay(), end.getTime() - Date.now() + 1000);
-    if (remaining <= 0) {
-        logger.info(`Timed roasts for ${day}: already ${timedRoasts}/${TIMED_ROASTS_PER_DAY}`);
-        return;
-    }
-    if (slots.length) {
-        const done = timedRoasts > 0 ? ` (${timedRoasts}/${TIMED_ROASTS_PER_DAY} already done)` : '';
-        logger.info(`Timed roasts for ${day}: ${slots.join(', ')}${done}`);
+        logger.error(`[!roast] random roast failed: ${err.message}`);
+        roastAt = qualifyingMessages + 1;
+        if (Api.isUsageLimit(err)) {
+            randomRoastRetryAt = Date.now() + 15 * 60 * 1000;
+            if (!randomRoastLimitSent && chatChannel) {
+                randomRoastLimitSent = true;
+                await chatChannel.send(quietMessage(err.message));
+            }
+            return;
+        }
+        randomRoastRetryAt = Date.now() + 60_000;
     }
 }
 
@@ -523,9 +517,11 @@ async function handleChatMessage(message) {
     const line = lineFromMessage(message);
     if (!line) return;
     const recorded = chat.record(line);
+    if (!recorded.added) return;
     if (recorded.ready) {
         logger.info(`[chat] ${who(message)} can be roasted again after ${recorded.spoken} lines`);
     }
+    await maybeRandomRoast(line.authorId);
 }
 
 async function seedChat(channel) {
@@ -579,7 +575,7 @@ async function openChatChannel(readyClient) {
     } else {
         logger.warn(api.configurationWarning());
     }
-    scheduleRoastDay();
+    logRandomRoastPlan(roastDay);
 }
 
 const client = new Client({
@@ -621,6 +617,15 @@ client.once(Events.ClientReady, async (readyClient) => {
     const statusName = channel.name ? `#${channel.name}` : statusChannelId;
     logger.info(`Status channel ${statusName}: watching ${FEEDS.map((feed) => feed.name).join(', ')} (base interval ${describeWait(pollIntervalMs)})`);
     logger.info('!aistatus in the status channel replies with the latest incident from each feed');
+    if (api.configured) {
+        logger.info(`!ai <prompt> in the status channel (${api.model})`);
+    } else if (!chatChannelId) {
+        logger.warn(api.configurationWarning());
+    }
+    if (!chatChannelId) {
+        const modelWarning = api.modelWarning();
+        if (modelWarning) logger.warn(modelWarning);
+    }
     await chatStartup;
     await tick(appState, channel);
 });
@@ -629,12 +634,21 @@ client.on(Events.MessageCreate, async (message) => {
     if (chatChannelId && message.channelId === chatChannelId) {
         enqueueChat(() => handleChatMessage(message));
     }
-    if (message.author.bot || message.channelId !== statusChannelId) return;
-    if (!STATUS_COMMAND.test(message.content.trim())) return;
+    if (message.author?.bot || message.channelId !== statusChannelId) return;
+    const content = message.content.trim();
+    if (STATUS_COMMAND.test(content)) {
+        try {
+            await replyStatus(message);
+        } catch (err) {
+            logger.error(`[!aistatus] ${who(message)} failed: ${err.message}`);
+        }
+        return;
+    }
+    if (message.channelId === chatChannelId || !AI_COMMAND.test(content)) return;
     try {
-        await replyStatus(message);
+        await handleAi(message);
     } catch (err) {
-        logger.error(`[!aistatus] ${who(message)} failed: ${err.message}`);
+        logger.error(`[!ai] ${who(message)} failed: ${err.message}`);
     }
 });
 
