@@ -9,22 +9,20 @@
 //
 
 
-export const CHAT_LOG_LIMIT = 100;
-export const MIN_ROAST_LINES = 3;
-export const MAX_ROAST_LINES = 10;
-export const ROAST_COMMAND = /^!roast(?:\s+([\s\S]+))?$/i;
-export const AI_COMMAND = /^!ai(?:\s+([\s\S]+))?$/i;
+import { botIdentity } from './messages.js';
+import { AI_COMMAND } from './prompt.js';
+import { MAX_ROAST_LINES, MIN_ROAST_LINES, ROAST_COMMAND } from './roast.js';
 
-export function roastName(content) {
-    const match = String(content || '').trim().match(ROAST_COMMAND);
-    if (!match) return null;
-    return (match[1] || '').trim();
+const CHAT_LOG_LIMIT = 100;
+
+export function isHumanMessage(message) {
+    return Boolean(message.author) && !message.author.bot && !message.webhookId && !message.system;
 }
 
-export function aiPrompt(content) {
-    const match = String(content || '').trim().match(AI_COMMAND);
-    if (!match) return null;
-    return (match[1] || '').trim();
+export function rememberBotMessage(chat, message) {
+    if (!(message.author?.bot || message.webhookId)) return;
+    const identity = botIdentity(message);
+    if (identity) chat.rememberBot(identity);
 }
 
 function identityNames(identity) {
@@ -45,26 +43,16 @@ export function lineFromMessage(message) {
     const content = message.content?.trim() || '';
     if (!content || ROAST_COMMAND.test(content) || AI_COMMAND.test(content)) return null;
     const user = message.author;
+    const identity = botIdentity(message);
+    if (!identity) return null;
     return {
         id: message.id,
         authorId: user.id,
-        username: user.username || '',
-        globalName: user.globalName || '',
-        nickname: message.member?.nickname || '',
-        displayName: message.member?.displayName || user.globalName || user.username || 'someone',
+        username: identity.username,
+        globalName: identity.globalName,
+        nickname: identity.nickname,
+        displayName: identity.displayName || 'someone',
         content,
-    };
-}
-
-export function botIdentity(message) {
-    const user = message.author;
-    if (!user?.id) return null;
-    return {
-        id: user.id,
-        username: user.username || '',
-        globalName: user.globalName || '',
-        nickname: message.member?.nickname || '',
-        displayName: message.member?.displayName || user.globalName || user.username || '',
     };
 }
 
@@ -192,4 +180,19 @@ export function createChat() {
             return needed;
         },
     };
+}
+
+export async function seedChat(chat, channel) {
+    const history = await channel.messages.fetch({ limit: CHAT_LOG_LIMIT });
+    const ordered = [...history.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+    let count = 0;
+    for (const message of ordered) {
+        if (!isHumanMessage(message)) {
+            rememberBotMessage(chat, message);
+            continue;
+        }
+        const line = lineFromMessage(message);
+        if (line && chat.record(line).added) count += 1;
+    }
+    return count;
 }
