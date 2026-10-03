@@ -90,21 +90,23 @@ export class Api {
         return `OPENROUTER_API_KEY is not set, so ${feature} are not configured.`;
     }
 
-    async complete({ system, user }) {
+    async complete({ system, user, temperature }) {
+        const body = {
+            model: this.model,
+            messages: [
+                { role: 'system', content: system },
+                { role: 'user', content: user },
+            ],
+            max_tokens: MAX_TOKENS,
+        };
+        if (temperature !== undefined) body.temperature = temperature;
         const response = await fetch(OPENROUTER_URL, {
             method: 'POST',
             headers: {
                 'content-type': 'application/json',
                 authorization: `Bearer ${this.apiKey}`,
             },
-            body: JSON.stringify({
-                model: this.model,
-                messages: [
-                    { role: 'system', content: system },
-                    { role: 'user', content: user },
-                ],
-                max_tokens: MAX_TOKENS,
-            }),
+            body: JSON.stringify(body),
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
         const payload = await response.json().catch(() => ({}));

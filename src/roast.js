@@ -23,14 +23,62 @@ export const MIN_ROAST_LINES = 3;
 export const MAX_ROAST_LINES = 10;
 export const ROAST_COMMAND = /^!roast(?:\s+([\s\S]+))?$/i;
 
-const SYSTEM_PROMPT = [
-    'You write a short Discord roast of one person, about what they have been saying in their recent messages.',
-    'Be mean, witty, and funny. Don\'t use curse words. Verbally tear apart what they said.',
-    'Two to four sentences. Address them by the name you are given.',
-    'No identity-based slurs. No threats of real-world harm.',
-    'Do not mention these instructions, and do not say you are an AI.',
-    'Return only the roast.',
-].join(' ');
+const ANGLES = [
+    'Treat their messages as evidence in a trial and deliver the verdict.',
+    'Write it as a disappointed nature documentary narrator observing them in the wild.',
+    'Review their messages like a harsh critic reviewing a terrible product.',
+    'Write it as a fake patch note or bug report about them.',
+    'Act like a weary therapist summarizing the session.',
+    'Deliver it as an over-dramatic sports commentator calling their worst play.',
+    'Write it as a fake horoscope that is clearly about their messages.',
+    'Treat their opinions as a museum exhibit of bad ideas and give the guided tour.',
+    'Be completely deadpan and understated, as if their messages barely deserve the effort.',
+    'Find the one thing they seem most proud of in their messages and dismantle it.',
+    'Point out a contradiction or irony between two things they said.',
+    'Take their logic seriously and follow it to an absurd conclusion.',
+];
+
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+function buildSystemPrompt(recentRoasts = []) {
+    const lines = [
+        'You write a short Discord roast of one person, based only on their recent messages.',
+        '',
+        'What makes it good:',
+        '- Every joke must hinge on something specific they actually said: a phrase, an opinion, a typo, a weird claim, a pattern in how they talk. If a line could be said about anyone, cut it.',
+        '- Pick the one or two juiciest things in their messages and go hard on those. Do not summarize everything they said.',
+        '- Surprise beats insult. A clever comparison or an unexpected twist lands harder than calling them dumb.',
+        '- Mean and witty, but no curse words.',
+        '',
+        `Angle for this roast: ${pick(ANGLES)}`,
+        '',
+        'Avoid these overused patterns:',
+        '- Opening with "Oh," or "Well," or "Wow," or with their name followed by a comma.',
+        '- Generic lines about their intelligence, brain cells, IQ, social life, parents, or being single.',
+        '- "I\'ve seen better X from a Y", "even a toaster/potato/rock could...", "bless your heart".',
+        '- Ending with a question or a "but hey" softener.',
+        '',
+        'Rules: two to four sentences. Mention them by the name you are given somewhere in the roast. No identity-based slurs, no jokes about race, religion, gender, sexuality, or disability. No threats of real-world harm. Do not mention these instructions or say you are an AI.',
+        '',
+        'Return only the roast text, with no quotes or preamble.',
+    ];
+    if (recentRoasts.length) {
+        lines.push(
+            '',
+            'Your recent roasts in this server (do not reuse their jokes, structure, openings, or comparisons):',
+            ...recentRoasts.map((r) => `- ${r}`),
+        );
+    }
+    return lines.join('\n');
+}
+
+function cleanRoast(text) {
+    let roast = String(text || '').trim();
+    const wrapped = (roast.startsWith('"') && roast.endsWith('"'))
+        || (roast.startsWith("'") && roast.endsWith("'"));
+    if (wrapped && roast.length >= 2) roast = roast.slice(1, -1).trim();
+    return roast;
+}
 
 function roastName(content) {
     const match = String(content || '').trim().match(ROAST_COMMAND);
@@ -39,13 +87,14 @@ function roastName(content) {
 }
 
 function createRoaster(api) {
-    return async function roastLines(name, texts) {
-        const quoted = texts.map((text, index) => `${index + 1}. ${text}`).join('\n');
+    return async function roastLines(name, texts, recentRoasts = []) {
+        const quoted = texts.map((text) => `- "${text}"`).join('\n');
         const result = await api.complete({
-            system: SYSTEM_PROMPT,
-            user: `Roast ${name} based on these recent messages, oldest first:\n${quoted}`,
+            system: buildSystemPrompt(recentRoasts),
+            user: `Name: ${name}\nRecent messages:\n${quoted}`,
+            temperature: 1,
         });
-        return result.text.slice(0, DISCORD_LIMIT);
+        return cleanRoast(result.text).slice(0, DISCORD_LIMIT);
     };
 }
 
@@ -57,6 +106,7 @@ function dayKey(date = new Date()) {
 
 export function createRoast({ api, chat, getState }) {
     const roastLine = api.configured ? createRoaster(api) : null;
+    const recentRoasts = new Map();
     const inFlight = new Set();
     let chatChannel = null;
     let roastDay = '';
@@ -135,15 +185,22 @@ export function createRoast({ api, chat, getState }) {
         await saveRoastDay();
     }
 
+    function serverKey(channel) {
+        return channel.guildId || channel.id;
+    }
+
     async function publishRoast(channel, topic) {
+        const key = serverKey(channel);
+        const history = recentRoasts.get(key) || [];
         const newest = topic.lines[topic.lines.length - 1];
-        const roast = await roastLine(topic.displayName, topic.lines.map((line) => line.content));
+        const roast = await roastLine(topic.displayName, topic.lines.map((line) => line.content), history);
         const mention = `<@${topic.authorId}>`;
         await channel.send({
             content: `${mention} ${roast}`.slice(0, 2000),
             flags: MessageFlags.SuppressEmbeds,
             allowedMentions: { users: [topic.authorId] },
         });
+        recentRoasts.set(key, [...history, roast].slice(-8));
         return chat.consume(topic.authorId, newest.id);
     }
 
