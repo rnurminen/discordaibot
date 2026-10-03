@@ -12,16 +12,16 @@
 import 'dotenv/config';
 import { Client, Events, GatewayIntentBits, MessageFlags } from 'discord.js';
 import logger from './logs/pino.js';
-import { CHAT_LOG_LIMIT, GEMINI_COMMAND, MIN_ROAST_LINES, ROAST_COMMAND, botIdentity, createChat, geminiPrompt, lineFromMessage, roastName } from './chat.js';
+import { AI_COMMAND, CHAT_LOG_LIMIT, MIN_ROAST_LINES, ROAST_COMMAND, aiPrompt, botIdentity, createChat, lineFromMessage, roastName } from './chat.js';
 import { FEEDS, commitRetry, commitSuccess, fetchFeed, formatMessage, formatStatusReport, shouldAnnounce } from './feeds.js';
-import { DEFAULT_MODEL, createAsker, createRoaster } from './roast.js';
+import { Api } from './api.js';
+import { createAsker, createRoaster } from './roast.js';
 import { feedState, loadState, saveState } from './state.js';
 
 const token = process.env.DISCORD_TOKEN?.trim();
 const statusChannelId = process.env.DISCORD_STATUS_CHANNEL_ID?.trim();
 const chatChannelId = process.env.DISCORD_CHAT_CHANNEL_ID?.trim() || '';
-const geminiKey = process.env.GEMINI_API_KEY?.trim() || '';
-const geminiModel = process.env.GEMINI_MODEL?.trim() || DEFAULT_MODEL;
+const api = Api.fromEnv();
 const pollIntervalMs = Number(process.env.POLL_INTERVAL_MS || 60_000);
 
 if (!token || !statusChannelId) {
@@ -164,9 +164,9 @@ const STATUS_COMMAND = /^!aistatus(?:\s|$)/i;
 let appState = null;
 const chat = createChat();
 const roastInFlight = new Set();
-const geminiInFlight = new Set();
-const roastLine = geminiKey ? createRoaster(geminiKey, geminiModel) : null;
-const askLine = geminiKey ? createAsker(geminiKey, geminiModel) : null;
+const aiInFlight = new Set();
+const roastLine = api.configured ? createRoaster(api) : null;
+const askLine = api.configured ? createAsker(api) : null;
 let chatQueue = Promise.resolve();
 let chatChannel = null;
 let roastDay = '';
@@ -369,7 +369,7 @@ async function runTimedRoast(day, attempt) {
         logger.info(`[!roast] timed roast ${timedRoasts}/${TIMED_ROASTS_PER_DAY} of ${topic.displayName} from ${topic.lines.length} lines; next roast after ${needed} new lines`);
     } catch (err) {
         logger.error(`[!roast] timed roast failed: ${err.message}`);
-        if (err.usageLimit && chatChannel) await chatChannel.send(quietMessage(err.message));
+        if (Api.isUsageLimit(err) && chatChannel) await chatChannel.send(quietMessage(err.message));
     }
 }
 
@@ -438,8 +438,8 @@ async function handleRoast(message) {
             return;
         }
         if (!roastLine) {
-            logger.info(`[!roast] ${actor} refused: GEMINI_API_KEY is not set`);
-            await message.reply(quietMessage('GEMINI_API_KEY is not set, so roasts are not configured.'));
+            logger.info(`[!roast] ${actor} refused: ${api.missingKeyMessage('roasts')}`);
+            await message.reply(quietMessage(api.missingKeyMessage('roasts')));
             return;
         }
         const needed = await publishRoast(message.channel, topic);
@@ -447,7 +447,7 @@ async function handleRoast(message) {
         logger.info(`[!roast] ${actor} roasted ${topic.displayName} from ${topic.lines.length} lines; next roast after ${needed} new lines`);
     } catch (err) {
         logger.error(`[!roast] ${actor} failed: ${err.message}`);
-        if (err.usageLimit) {
+        if (Api.isUsageLimit(err)) {
             await message.channel.send(quietMessage(err.message));
             return;
         }
@@ -457,41 +457,41 @@ async function handleRoast(message) {
     }
 }
 
-async function handleGemini(message) {
-    const prompt = geminiPrompt(message.content);
+async function handleAi(message) {
+    const prompt = aiPrompt(message.content);
     const userId = message.author.id;
     const actor = who(message);
-    if (geminiInFlight.has(userId)) {
-        logger.info(`[!gemini] ${actor} refused: answer already running`);
+    if (aiInFlight.has(userId)) {
+        logger.info(`[!ai] ${actor} refused: answer already running`);
         await message.reply(quietMessage('Still answering. Wait for that one to finish.'));
         return;
     }
     if (!prompt) {
-        logger.info(`[!gemini] ${actor} refused: missing prompt`);
-        await message.reply(quietMessage('Usage: !gemini <prompt>'));
+        logger.info(`[!ai] ${actor} refused: missing prompt`);
+        await message.reply(quietMessage('Usage: !ai <prompt>'));
         return;
     }
     if (!askLine) {
-        logger.info(`[!gemini] ${actor} refused: GEMINI_API_KEY is not set`);
-        await message.reply(quietMessage('GEMINI_API_KEY is not set, so Gemini is not configured.'));
+        logger.info(`[!ai] ${actor} refused: ${api.missingKeyMessage('answers')}`);
+        await message.reply(quietMessage(api.missingKeyMessage('answers')));
         return;
     }
 
-    geminiInFlight.add(userId);
+    aiInFlight.add(userId);
     try {
-        logger.info(`[!gemini] ${actor}: ${clip(prompt)}`);
+        logger.info(`[!ai] ${actor}: ${clip(prompt)}`);
         const answer = await askLine(prompt);
-        await message.channel.send(roastPost(codeBlock(answer, `(${geminiModel})`)));
-        logger.info(`[!gemini] ${actor} answered (${answer.length} chars)`);
+        await message.channel.send(roastPost(codeBlock(answer.text, `(${answer.model})`)));
+        logger.info(`[!ai] ${actor} answered (${answer.text.length} chars, ${answer.model})`);
     } catch (err) {
-        logger.error(`[!gemini] ${actor} failed: ${err.message}`);
-        if (err.usageLimit) {
+        logger.error(`[!ai] ${actor} failed: ${err.message}`);
+        if (Api.isUsageLimit(err)) {
             await message.channel.send(quietMessage(err.message));
             return;
         }
-        await message.reply(quietMessage((err.message || 'Could not ask Gemini.').slice(0, 2000)));
+        await message.reply(quietMessage((err.message || 'Could not answer.').slice(0, 2000)));
     } finally {
-        geminiInFlight.delete(userId);
+        aiInFlight.delete(userId);
     }
 }
 
@@ -512,11 +512,11 @@ async function handleChatMessage(message) {
         }
         return;
     }
-    if (GEMINI_COMMAND.test(content)) {
+    if (AI_COMMAND.test(content)) {
         try {
-            await handleGemini(message);
+            await handleAi(message);
         } catch (err) {
-            logger.error(`[!gemini] ${who(message)} failed: ${err.message}`);
+            logger.error(`[!ai] ${who(message)} failed: ${err.message}`);
         }
         return;
     }
@@ -572,10 +572,12 @@ async function openChatChannel(readyClient) {
     }
     const chatName = channel.name ? `#${channel.name}` : chatChannelId;
     logger.info(`Chat channel ${chatName}: ${seeded} recent lines loaded`);
-    if (geminiKey) {
-        logger.info(`Chat commands: !roast <username>, !gemini <prompt> (${geminiModel})`);
+    const modelWarning = api.modelWarning();
+    if (modelWarning) logger.warn(modelWarning);
+    if (api.configured) {
+        logger.info(`Chat commands: !roast <username>, !ai <prompt> (${api.model})`);
     } else {
-        logger.warn('GEMINI_API_KEY is not set. !roast and !gemini will say they are not configured.');
+        logger.warn(api.configurationWarning());
     }
     scheduleRoastDay();
 }

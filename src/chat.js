@@ -13,7 +13,7 @@ export const CHAT_LOG_LIMIT = 100;
 export const MIN_ROAST_LINES = 3;
 export const MAX_ROAST_LINES = 10;
 export const ROAST_COMMAND = /^!roast(?:\s+([\s\S]+))?$/i;
-export const GEMINI_COMMAND = /^!gemini(?:\s+([\s\S]+))?$/i;
+export const AI_COMMAND = /^!ai(?:\s+([\s\S]+))?$/i;
 
 export function roastName(content) {
     const match = String(content || '').trim().match(ROAST_COMMAND);
@@ -21,8 +21,8 @@ export function roastName(content) {
     return (match[1] || '').trim();
 }
 
-export function geminiPrompt(content) {
-    const match = String(content || '').trim().match(GEMINI_COMMAND);
+export function aiPrompt(content) {
+    const match = String(content || '').trim().match(AI_COMMAND);
     if (!match) return null;
     return (match[1] || '').trim();
 }
@@ -43,7 +43,7 @@ function mentionId(query) {
 
 export function lineFromMessage(message) {
     const content = message.content?.trim() || '';
-    if (!content || ROAST_COMMAND.test(content) || GEMINI_COMMAND.test(content)) return null;
+    if (!content || ROAST_COMMAND.test(content) || AI_COMMAND.test(content)) return null;
     const user = message.author;
     return {
         id: message.id,

@@ -12,7 +12,7 @@ Posts new and updated incidents from the Claude, Cursor, and OpenAI status feeds
 ```bash
 cp .env.example .env
 # set DISCORD_TOKEN and DISCORD_STATUS_CHANNEL_ID
-# for roasts, also set DISCORD_CHAT_CHANNEL_ID and GEMINI_API_KEY
+# for roasts, also set DISCORD_CHAT_CHANNEL_ID and OPENROUTER_API_KEY
 npm install
 npm start
 ```
@@ -33,9 +33,9 @@ After a roast, that person is locked until they post another 3 to 10 lines. The 
 
 Each day the bot also posts up to two timed roasts, at random times, of people who have enough lines and have not been roasted with `!roast` that day. That day's count is kept in `data/state.json`, so a restart does not start it over.
 
-`!gemini <prompt>` asks that question on the same Gemini model. The bot tells it to keep the answer short: a sentence or two for a simple question, a short paragraph for a broader one.
+`!ai <prompt>` asks that question through OpenRouter. The bot tells it to keep the answer short: a sentence or two for a simple question, a short paragraph for a broader one. The reply names the free model that answered.
 
-Roasts use the Gemini API free tier. Create a key in [Google AI Studio](https://aistudio.google.com/apikey) and set `GEMINI_API_KEY`. If the chat channel is set and the key is missing, the bot still starts, and `!roast` says the key is not configured. `GEMINI_MODEL` defaults to `gemini-3.5-flash`.
+Roasts and answers use OpenRouter free models only. Create a key at [OpenRouter](https://openrouter.ai/keys) and set `OPENROUTER_API_KEY`. Each request sends `openrouter/free`, which routes only to free models. Set `OPENROUTER_MODEL` to a model id ending in `:free` to pin one free model. Any other value is ignored and the request still uses `openrouter/free`. If the chat channel is set and the key is missing, the bot still starts, and `!roast` says the key is not configured.
 
 ## Feeds
 
