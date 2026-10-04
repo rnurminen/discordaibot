@@ -107,7 +107,7 @@ async function openChatChannel(readyClient) {
     const modelWarning = api.modelWarning();
     if (modelWarning) logger.warn(modelWarning);
     if (api.configured) {
-        logger.info(`Chat commands: !roast <username>, !ai <prompt> (${api.model})`);
+        logger.info(`Chat commands: !roast <username>, !ai <prompt> (${api.providerLabel()})`);
     } else {
         logger.warn(api.configurationWarning());
     }
@@ -152,7 +152,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     const channel = await fetchTextChannel(readyClient, config.statusChannelId, 'status channel');
     status.announce(channel, config.statusChannelId);
     if (api.configured) {
-        logger.info(`!ai <prompt> in the status channel (${api.model})`);
+        logger.info(`!ai <prompt> in the status channel (${api.providerLabel()})`);
     } else if (!config.chatChannelId) {
         logger.warn(api.configurationWarning());
     }

@@ -9,10 +9,15 @@
 //
 
 
+import logger from './logger.js';
+
 const DEFAULT_MODEL = 'openrouter/free';
+const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const MAX_TOKENS = 1024;
 const REQUEST_TIMEOUT_MS = 20_000;
+const ERROR_LIMIT = 240;
 
 function freeModel(model) {
     const id = String(model || '').trim();
@@ -55,42 +60,150 @@ function messageText(message) {
         .join('');
 }
 
+function briefError(err) {
+    const message = String(err?.message || err || 'request failed').replace(/\s+/g, ' ').trim();
+    if (!message) return 'request failed';
+    if (message.length <= ERROR_LIMIT) return message;
+    return `${message.slice(0, ERROR_LIMIT - 3)}...`;
+}
+
+function geminiThinking(model) {
+    if (/^gemini-3/i.test(model)) return { thinkingConfig: { thinkingLevel: 'MINIMAL' } };
+    return {};
+}
+
+function geminiPartsText(candidate) {
+    const parts = candidate?.content?.parts;
+    if (!Array.isArray(parts)) return '';
+    return parts
+        .filter((part) => part && !part.thought && typeof part.text === 'string')
+        .map((part) => part.text)
+        .join('');
+}
+
+function geminiBlockMessage(payload) {
+    const feedback = payload?.promptFeedback;
+    if (feedback?.blockReason) return feedback.blockReasonMessage || String(feedback.blockReason);
+    const candidate = payload?.candidates?.[0];
+    const reason = candidate?.finishReason;
+    if (reason && reason !== 'STOP' && reason !== 'MAX_TOKENS') {
+        return candidate.finishMessage || `The model blocked the response (${reason})`;
+    }
+    return '';
+}
+
 export class Api {
     static fromEnv(env = process.env) {
         const apiKey = env.OPENROUTER_API_KEY?.trim() || '';
         const requested = env.OPENROUTER_MODEL?.trim() || '';
-        return new Api(apiKey, requested);
+        const geminiKey = env.GEMINI_API_KEY?.trim() || '';
+        const geminiModel = env.GEMINI_MODEL?.trim() || '';
+        return new Api(apiKey, requested, geminiKey, geminiModel);
     }
 
     static isUsageLimit(err) {
         return Boolean(err?.usageLimit);
     }
 
-    constructor(apiKey, requestedModel = '') {
+    constructor(apiKey, requestedModel = '', geminiKey = '', geminiModel = '') {
         this.apiKey = String(apiKey || '').trim();
         this.requested = String(requestedModel || '').trim();
         this.model = freeModel(this.requested);
+        this.geminiKey = String(geminiKey || '').trim();
+        this.geminiModel = String(geminiModel || '').trim() || DEFAULT_GEMINI_MODEL;
     }
 
-    get configured() {
+    get openRouterConfigured() {
         return this.apiKey.length > 0;
     }
 
+    get geminiConfigured() {
+        return this.geminiKey.length > 0;
+    }
+
+    get configured() {
+        return this.geminiConfigured || this.openRouterConfigured;
+    }
+
+    providerLabel() {
+        if (this.geminiConfigured && this.openRouterConfigured) return `${this.geminiModel}, fallback ${this.model}`;
+        if (this.geminiConfigured) return this.geminiModel;
+        return this.model;
+    }
+
     modelWarning() {
-        if (!this.requested || this.requested === this.model) return '';
+        if (!this.openRouterConfigured || !this.requested || this.requested === this.model) return '';
         return `OPENROUTER_MODEL ${this.requested} is not a free model. Using ${this.model}.`;
     }
 
     configurationWarning() {
         if (this.configured) return '';
-        return 'OPENROUTER_API_KEY is not set. !roast and !ai will say they are not configured.';
+        return 'GEMINI_API_KEY and OPENROUTER_API_KEY are not set. !roast and !ai will say they are not configured.';
     }
 
     missingKeyMessage(feature) {
-        return `OPENROUTER_API_KEY is not set, so ${feature} are not configured.`;
+        return `GEMINI_API_KEY and OPENROUTER_API_KEY are not set, so ${feature} are not configured.`;
     }
 
     async complete({ system, user, temperature }) {
+        if (!this.geminiConfigured) return this.completeOpenRouter({ system, user, temperature });
+
+        try {
+            return await this.completeGemini({ system, user, temperature });
+        } catch (err) {
+            const geminiError = briefError(err);
+            if (!this.openRouterConfigured) throw new Error(`Gemini API error: ${geminiError}`);
+            logger.warn(`Gemini API error: ${geminiError}; falling back to ${this.model}`);
+            try {
+                const result = await this.completeOpenRouter({ system, user, temperature });
+                return {
+                    text: result.text,
+                    model: `Gemini API error: ${geminiError}, used model: ${result.model}`,
+                };
+            } catch (openErr) {
+                const openModel = openErr?.model || this.model;
+                throw new Error(`Gemini API error: ${geminiError}, OpenRouter (${openModel}) error: ${briefError(openErr)}`);
+            }
+        }
+    }
+
+    async completeGemini({ system, user, temperature }) {
+        const generationConfig = {
+            maxOutputTokens: MAX_TOKENS,
+            ...geminiThinking(this.geminiModel),
+        };
+        if (temperature !== undefined) generationConfig.temperature = temperature;
+        const response = await fetch(`${GEMINI_URL}/${encodeURIComponent(this.geminiModel)}:generateContent`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-goog-api-key': this.geminiKey,
+            },
+            body: JSON.stringify({
+                systemInstruction: { parts: [{ text: system }] },
+                contents: [{ role: 'user', parts: [{ text: user }] }],
+                generationConfig,
+            }),
+            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const detail = payload.error;
+            const message = (typeof detail === 'string' ? detail : detail?.message)
+                || `Model request failed (${response.status})`;
+            throw new Error(message);
+        }
+        const blocked = geminiBlockMessage(payload);
+        if (blocked) throw new Error(blocked);
+        const text = geminiPartsText(payload.candidates?.[0]).trim();
+        if (!text) throw new Error('The model returned an empty response');
+        const used = typeof payload.modelVersion === 'string' && payload.modelVersion.trim()
+            ? payload.modelVersion.trim()
+            : this.geminiModel;
+        return { text, model: used };
+    }
+
+    async completeOpenRouter({ system, user, temperature }) {
         const body = {
             model: this.model,
             messages: [
