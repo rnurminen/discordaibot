@@ -18,6 +18,9 @@ const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const MAX_TOKENS = 1024;
 const REQUEST_TIMEOUT_MS = 20_000;
 const ERROR_LIMIT = 240;
+const FREE_ROUTER_ATTEMPTS = 3;
+const NON_CHAT_MODEL = /content[-_]?safety|llama[-_]?guard|prompt[-_]?guard|shieldgemma|moderation|safety[-_]?guard/i;
+const SAFETY_VERDICT = /^(user|content|prompt)\s+safety\s*:/i;
 
 function freeModel(model) {
     const id = String(model || '').trim();
@@ -79,6 +82,11 @@ function geminiPartsText(candidate) {
         .filter((part) => part && !part.thought && typeof part.text === 'string')
         .map((part) => part.text)
         .join('');
+}
+
+function nonChatModel(model, text) {
+    if (NON_CHAT_MODEL.test(model || '')) return true;
+    return SAFETY_VERDICT.test(String(text || '').trim());
 }
 
 function geminiBlockMessage(payload) {
@@ -204,6 +212,18 @@ export class Api {
     }
 
     async completeOpenRouter({ system, user, temperature }) {
+        const attempts = this.model === DEFAULT_MODEL ? FREE_ROUTER_ATTEMPTS : 1;
+        let skipped = '';
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+            const result = await this.requestOpenRouter({ system, user, temperature });
+            if (!nonChatModel(result.model, result.text)) return result;
+            skipped = result.model;
+            logger.warn(`Skipping ${result.model}; it is a classifier, not a chat model`);
+        }
+        throw new Error(`OpenRouter returned a classifier (${skipped}) instead of a chat model`);
+    }
+
+    async requestOpenRouter({ system, user, temperature }) {
         const body = {
             model: this.model,
             messages: [
