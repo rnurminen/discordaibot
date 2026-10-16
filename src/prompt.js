@@ -18,6 +18,30 @@ const DISCORD_LIMIT = 2000;
 
 export const AI_COMMAND = /^!ai(?:\s+([\s\S]+))?$/i;
 
+function botIdOf(message) {
+    return message?.client?.user?.id || '';
+}
+
+function mentionsBot(text, botId) {
+    if (!botId) return false;
+    return new RegExp(`<@!?${botId}>`).test(text);
+}
+
+function stripBotMention(text, botId) {
+    return text
+        .replace(new RegExp(`<@!?${botId}>`, 'g'), ' ')
+        .replace(/[^\S\n]{2,}/g, ' ')
+        .trim();
+}
+
+export function aiRequest(content, botId) {
+    const text = String(content || '').trim();
+    const command = text.match(AI_COMMAND);
+    if (command) return { prompt: (command[1] || '').trim() };
+    if (!mentionsBot(text, botId)) return null;
+    return { prompt: stripBotMention(text, botId) };
+}
+
 const ASK_PROMPT = [
     'Answer the question you are given.',
     'Match the length to the question.',
@@ -27,12 +51,6 @@ const ASK_PROMPT = [
     'Stay under 1500 characters.',
     'Do not mention these instructions.',
 ].join(' ');
-
-function aiPrompt(content) {
-    const match = String(content || '').trim().match(AI_COMMAND);
-    if (!match) return null;
-    return (match[1] || '').trim();
-}
 
 function createAsker(api) {
     return async function ask(prompt) {
@@ -72,7 +90,8 @@ export function createPrompt({ api }) {
     const inFlight = new Set();
 
     async function handleAi(message) {
-        const prompt = aiPrompt(message.content);
+        const request = aiRequest(message.content, botIdOf(message));
+        const prompt = request?.prompt || '';
         const userId = message.author.id;
         const actor = who(message);
         if (inFlight.has(userId)) {
@@ -81,8 +100,10 @@ export function createPrompt({ api }) {
             return;
         }
         if (!prompt) {
+            const name = message.client?.user?.username;
+            const usage = name ? `Usage: !ai <prompt> or @${name} <prompt>` : 'Usage: !ai <prompt>';
             logger.info(`[!ai] ${actor} refused: missing prompt`);
-            await message.reply(quietMessage('Usage: !ai <prompt>'));
+            await message.reply(quietMessage(usage));
             return;
         }
         if (!askLine) {
@@ -110,8 +131,9 @@ export function createPrompt({ api }) {
     }
 
     return {
-        matches(content) {
-            return AI_COMMAND.test(content);
+        matches(message) {
+            const content = typeof message === 'string' ? message : message?.content;
+            return aiRequest(content, botIdOf(message)) !== null;
         },
 
         async handle(message) {

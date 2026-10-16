@@ -64,7 +64,7 @@ async function handleChatMessage(message) {
         await roast.handle(message);
         return;
     }
-    if (prompt.matches(content)) {
+    if (prompt.matches(message)) {
         await prompt.handle(message);
         return;
     }
@@ -107,7 +107,7 @@ async function openChatChannel(readyClient) {
     const modelWarning = api.modelWarning();
     if (modelWarning) logger.warn(modelWarning);
     if (api.configured) {
-        logger.info(`Chat commands: !roast <username>, !ai <prompt> (${api.providerLabel()})`);
+        logger.info(`Chat commands: !roast <username>, !ai <prompt>, or @${self.username} (${api.providerLabel()})`);
     } else {
         logger.warn(api.configurationWarning());
     }
@@ -152,7 +152,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     const channel = await fetchTextChannel(readyClient, config.statusChannelId, 'status channel');
     status.announce(channel, config.statusChannelId);
     if (api.configured) {
-        logger.info(`!ai <prompt> in the status channel (${api.providerLabel()})`);
+        logger.info(`!ai <prompt> or an @mention in the status channel (${api.providerLabel()})`);
     } else if (!config.chatChannelId) {
         logger.warn(api.configurationWarning());
     }
@@ -174,7 +174,7 @@ client.on(Events.MessageCreate, async (message) => {
         await status.reply(message);
         return;
     }
-    if (message.channelId === config.chatChannelId || !prompt.matches(content)) return;
+    if (message.channelId === config.chatChannelId || !prompt.matches(message)) return;
     await prompt.handle(message);
 });
 

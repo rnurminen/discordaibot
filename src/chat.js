@@ -10,7 +10,7 @@
 
 
 import { botIdentity } from './messages.js';
-import { AI_COMMAND } from './prompt.js';
+import { aiRequest } from './prompt.js';
 import { MAX_ROAST_LINES, MIN_ROAST_LINES, ROAST_COMMAND } from './roast.js';
 
 const CHAT_LOG_LIMIT = 100;
@@ -41,7 +41,8 @@ function mentionId(query) {
 
 export function lineFromMessage(message) {
     const content = message.content?.trim() || '';
-    if (!content || ROAST_COMMAND.test(content) || AI_COMMAND.test(content)) return null;
+    const botId = message.client?.user?.id;
+    if (!content || ROAST_COMMAND.test(content) || aiRequest(content, botId)) return null;
     const user = message.author;
     const identity = botIdentity(message);
     if (!identity) return null;
